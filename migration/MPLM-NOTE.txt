@@ -1,0 +1,4 @@
+ 07-Sep-19: MPLM migration is an optional migration mechanism that users must use a qmp 
+ command to set up migration configutation. The default mechanism is the original one. 
+ After users enable mplm with this command, the original "migrate" and "savevm" operation would not work. 
+ To activate them, users have to issue this qmp command  again and set the "enable" parameter to false. 
