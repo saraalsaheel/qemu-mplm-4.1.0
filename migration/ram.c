@@ -58,6 +58,39 @@
 #include "savevm.h"
 #include "qemu/iov.h"
 
+/***** Beginning of MPLM Definitions and global variables *****
+*/
+#include <math.h>
+
+#define         MIN_DELAY_INTERVAL  50 		// minimal gap duration (ms) between 2 bitmapsync
+
+extern uint8_t          mplm_flag;
+extern int              mplm_interval;  	// in sec.
+extern int              mplm_interval_usec;     // in usec.
+extern int              max_mplm_interval;      // in sec.
+
+extern int              mplm_send_counter;
+extern int              mplm_send_cycle_size;
+extern int              mplm_dirty_pages_sent;
+extern int              mplm_dirty_pages_allot;
+extern int              mplm_nondirty_pages_sent;
+extern int              mplm_nondirty_pages_allot;
+
+extern int64_t          checked_mplm_nondirty_sent;
+extern int64_t          checked_mplm_dirty_sent;
+extern int64_t          real_mplm_nondirty_sent;
+extern int64_t          real_mplm_dirty_sent;
+extern int64_t          real_mplm_S3_dirty_sent;
+
+int                     mplm_bitmap_sync_flag = 0;
+int                     mplm_live_migration_stage_finish = 0;
+
+uint64_t                mplm_total_ram_pages;
+struct timeval          mplm_wakeup_time;
+
+int                     num_enter_ram_save_iterate = 0;
+int64_t                 last_t0 = 0;
+
 /***********************************************************/
 /* ram save/restore */
 

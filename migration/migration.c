@@ -101,19 +101,21 @@
 */
 #define 	MPLM_ENABLE	1
 #define 	MPLM_DISABLE	0
-// MPLM DEFAULTS
+
+#define 	MPLM_LIVE_MIGRATION_MODE		1
+#define 	MPLM_LIVE_CHECKPOINT_MODE		2
+
 #define         MPLM_DEFAULT_INV_INTERVAL               3
 #define         MPLM_DEFAULT_TX_CYCLE                   1024
 #define         MPLM_DEFAULT_DIRTY_TX_PERCENTS          50
 #define         MPLM_DEFAULT_MINNONDIRTY_TX_PERCENTS    10
 
-int mplm_flag = MPLM_DISABLE; 
+int 		mplm_flag 			= MPLM_DISABLE; 
 
 int             mplm_interval 			= MPLM_DEFAULT_INV_INTERVAL;  // in sec.
 int             mplm_interval_usec 		= 0; // in usec.
 int             max_mplm_interval 		= MPLM_DEFAULT_INV_INTERVAL;  // in sec.
 
-// MPLM
 int             mplm_send_counter 		= 0;
 int             mplm_send_cycle_size 		= MPLM_DEFAULT_TX_CYCLE;
 double          mplm_minimal_tx_ratio 		= ((double)(MPLM_DEFAULT_MINNONDIRTY_TX_PERCENTS)/100.0);
@@ -121,6 +123,29 @@ int             mplm_dirty_pages_sent;
 int             mplm_dirty_pages_allot 		= 0;
 int             mplm_nondirty_pages_sent;
 int             mplm_nondirty_pages_allot 	= 0;
+
+int64_t         checked_mplm_nondirty_sent;
+int64_t         checked_mplm_dirty_sent;
+int64_t         lastchecked_mplm_nondirty_sent;
+int64_t         lastchecked_mplm_dirty_sent;
+
+int64_t         real_mplm_nondirty_sent;
+int64_t         real_mplm_dirty_sent;
+int64_t         lastreal_mplm_nondirty_sent;
+int64_t         lastreal_mplm_dirty_sent;
+
+int64_t         real_mplm_S3_dirty_sent;
+
+extern int      mplm_bitmap_sync_flag;
+extern int      mplm_live_migration_stage_finish;
+
+uint64_t        mplm_bitmap_sync_time = 0;
+int             mplm_debug_i = 0;
+
+int 		mplm_live_checkpointing_flag = 0;
+int 		mplm_max_migration_rate_limit_flag = 0;
+int 		mplm_use_post_checkpoint_script_flag = 0;
+int 		mplm_stop_after_checkpointing_finish_flag = 0;
 
 /***** End of MPLM Definitions and global variables *****
 */
@@ -425,6 +450,18 @@ static void process_incoming_migration_bh(void *opaque)
      * we're sure the VM is going to be running on this host.
      */
     qemu_announce_self(&mis->announce_timer, migrate_announce_params());
+
+//MPLM-MPLCR
+    const char *funname="process_incoming_migration_bh()\0"; 
+    if(mplm_live_checkpointing_flag){
+        // stop vm execution
+        autostart = false; 
+        printf("%s: MPLCR live checkpoining is ON. autostart = false, Pause the VM\n", funname); 
+        fflush(stdout); 
+
+        //change migration flag from checkpointing to migration (default)
+        mplm_live_checkpointing_flag = 0; 
+    }    
 
     if (multifd_load_cleanup(&local_err) != 0) {
         error_report_err(local_err);
@@ -788,6 +825,10 @@ MigrationParameters *qmp_query_migrate_parameters(Error **errp)
     params->tls_authz = g_strdup(s->parameters.tls_authz);
     params->has_max_bandwidth = true;
     params->max_bandwidth = s->parameters.max_bandwidth;
+
+// MPLM 
+    mplm_max_migration_rate_limit_flag = 0;
+
     params->has_downtime_limit = true;
     params->downtime_limit = s->parameters.downtime_limit;
     params->has_x_checkpoint_delay = true;
@@ -1471,6 +1512,47 @@ void qmp_migrate_start_postcopy(Error **errp)
     atomic_set(&s->start_postcopy, true);
 }
 
+// MPLM 
+int qmp_mplm_extend_live_migration = 0;
+
+extern int mplm_extend_live_migration(void);
+
+void qmp_set_mplm_extend_live(Error **errp)
+{
+    qmp_mplm_extend_live_migration = 1;
+    printf("Enable live migration extension capability! set extension var to 1.\n");
+}
+
+void qmp_set_mplm_end_live(Error **errp)
+{
+    qmp_mplm_extend_live_migration = 0;
+    printf("End live migration extension capability! set extension var to 0.\n");
+}
+
+void qmp_live_checkpointing_enable(Error **errp)
+{
+    mplm_live_checkpointing_flag = 1;
+    printf("Enable live checkpointing. After finishes, it will be disable.\n");
+}
+
+void qmp_live_checkpointing_disable(Error **errp)
+{
+    mplm_live_checkpointing_flag = 0;
+    printf("Disable live checkpointing.\n");
+}
+
+void qmp_enable_max_migration_rate_limit(Error **errp)
+{
+    mplm_max_migration_rate_limit_flag = 1;
+    printf("Enable max migration rate limit = %"PRId64".\n", INT64_MAX);
+}
+
+void qmp_disable_max_migration_rate_limit(Error **errp)
+{
+    mplm_max_migration_rate_limit_flag = 0;
+    printf("Disable max migration rate limit (to default value or whatever user previously define).\n");
+}
+
 /* shared migration helpers */
 
 void migrate_set_state(int *state, int old_state, int new_state)
@@ -1717,6 +1799,7 @@ bool migration_is_idle(void)
 
 void migrate_init(MigrationState *s)
 {
+    const char *funname="migrate_init()\0"; 
     /*
      * Reinitialise all migration state, except
      * parameters/capabilities that the user set, and
@@ -1746,6 +1829,30 @@ void migrate_init(MigrationState *s)
     s->vm_was_running = false;
     s->iteration_initial_bytes = 0;
     s->threshold_size = 0;
+
+    if(mplm_flag){
+      // MPLM: initialize variables.
+      mplm_send_counter = 0;
+      mplm_dirty_pages_sent = 0;
+      mplm_nondirty_pages_sent = 0;
+
+      checked_mplm_nondirty_sent = 0;
+      checked_mplm_dirty_sent = 0;
+      lastchecked_mplm_nondirty_sent = 0;
+      lastchecked_mplm_dirty_sent = 0;
+
+      real_mplm_nondirty_sent = 0;
+      real_mplm_dirty_sent = 0;
+      real_mplm_S3_dirty_sent = 0;
+      lastreal_mplm_nondirty_sent = 0;
+      lastreal_mplm_dirty_sent = 0;
+
+      mplm_bitmap_sync_flag = 0;
+      mplm_bitmap_sync_time = 0;
+
+      printf("%s: Start MPLM migration, mplm_interval =(%d sec %d usec)\n", funname, mplm_interval, mplm_interval_usec);
+    }
+
 }
 
 static GSList *migration_blockers;
@@ -1796,6 +1903,55 @@ void qmp_migrate_incoming(const char *uri, Error **errp)
     }
 
     once = false;
+}
+
+// MPLM
+#define MPLM_SCRIPT_NAME_LEN 200
+
+char mplm_post_checkpoint_cmd[MPLM_SCRIPT_NAME_LEN];
+
+// MPLM
+void qmp_mplcr_post_checkpointing_script(const char *uri, Error **errp)
+{
+    Error *local_err = NULL;
+
+    const char *funname="qmp_mplcr_post_checkpointing_script()\0"; 
+
+    if (!((mplm_flag)&&(mplm_live_checkpointing_flag))) {
+        error_setg(errp, "Error! script only allowed with MPLCR enabled");
+        return;
+    }    
+
+    // MPLM
+    printf("%s: defining post checkpointing script (usually used for creating btrfs snapshots).\n", funname); 
+    fflush(stdout); 
+
+    if(uri){
+      mplm_use_post_checkpoint_script_flag = 1; 
+      pstrcpy(mplm_post_checkpoint_cmd, MPLM_SCRIPT_NAME_LEN, uri);
+
+      printf("%s: script = %s\n", funname, mplm_post_checkpoint_cmd); 
+      fflush(stdout); 
+
+    } else {
+      error_setg(errp, "Error! no abs pathanem of script specified");
+    }    
+
+    if (local_err) {
+        error_propagate(errp, local_err);
+        return;
+    }    
+}
+
+int mplcr_stop_after_checkpointing_flag = 0;
+
+// MPLM
+void qmp_mplcr_stop_after_checkpointing(Error **errp)
+{
+    const char *funname="qmp_mplcr_stop_after_checkpointing()\0"; 
+
+    mplcr_stop_after_checkpointing_flag = 1;
+    printf("%s: Enable mplcr stop after checkpointing. This flag Will be disable when checkpointing is done!\n", funname);
 }
 
 void qmp_migrate_recover(const char *uri, Error **errp)
@@ -1946,6 +2102,11 @@ void qmp_migrate(const char *uri, bool has_blk, bool blk,
     Error *local_err = NULL;
     MigrationState *s = migrate_get_current();
     const char *p;
+
+    // MPLM
+    const char *funname="qmp_migrate()\0"; 
+    printf("%s: Start performing migration!\n", funname);
+    fflush(stdout);
 
     if (!migrate_prepare(s, has_blk && blk, has_inc && inc,
                          has_resume && resume, errp)) {
@@ -3397,8 +3558,12 @@ void migration_global_dump(Monitor *mon)
 /* 
  07-Sep-19: MPLM migration is an optional migration mechanism that users must use a qmp 
  command to set up migration configutation. The default mechanism is the original one. 
- After users enable mplm with this command, the original "migrate" and "savevm" operation would not work. 
- To activate them, users have to issue this qmp command  again and set the "enable" parameter to false. 
+ Users are required to enable mplm only at the sender side (for MPLM version 2). 
+
+ After users enable mplm with this command, stting the "enable" parameter to true, 
+ the original "migrate" and "savevm" operations would not work. 
+ If users want to use the original "migrate" and "savevm", they have to issue 
+ the following  qmp command and set the "enable" parameter to false. 
 */
 void qmp_set_mplm_migration(bool enable, int64_t dirtypagetrackinginterval,
      int64_t mode, int64_t initdirtypagetxpercents, int64_t minnondirtypagetxpercents, Error **errp)
@@ -3407,25 +3572,53 @@ void qmp_set_mplm_migration(bool enable, int64_t dirtypagetrackinginterval,
 
     printf("%s: enable=%d, dirtypagetrackinginterval=%"PRId64", mode=%"PRId64",\n    initdirtypagetxpercents=%"PRId64", minnondirtypagetxpercents=%"PRId64" \n", 
         funname, (int)enable, dirtypagetrackinginterval, mode, initdirtypagetxpercents, minnondirtypagetxpercents); 
+    fflush(stdout); 
     
-    if(enable){
+    if((int)enable){
 	mplm_flag = MPLM_ENABLE; 
     }else{
 	mplm_flag = MPLM_DISABLE; 
         return; 
     }
 
+    if(mode == MPLM_LIVE_MIGRATION_MODE){
+        mplm_live_checkpointing_flag = 0;
+    }
+    else if(mode == MPLM_LIVE_CHECKPOINT_MODE){
+        mplm_live_checkpointing_flag = 1;
+    }
+    else{
+        printf("%s: Undefined MPLM migration mode %" PRId64 "\n", funname, mode);  
+        fflush(stdout); 
+    }
+
     if ((initdirtypagetxpercents <= 0)||(initdirtypagetxpercents >= 100)){
-       printf("%s: Invalid initdirtypagetxpercents! Set to default values\n", funname);  
-       initdirtypagetxpercents = MPLM_DEFAULT_DIRTY_TX_PERCENTS;  
+        printf("%s: Invalid initdirtypagetxpercents! Set to default values\n", funname);  
+        fflush(stdout); 
+        initdirtypagetxpercents = MPLM_DEFAULT_DIRTY_TX_PERCENTS;  
     }
     if ((minnondirtypagetxpercents <= 0)||(minnondirtypagetxpercents >= 100)){
-       printf("%s: Invalid minnondirtypagetxpercents! Set to default values\n", funname);  
-       minnondirtypagetxpercents = MPLM_DEFAULT_MINNONDIRTY_TX_PERCENTS;  
+        printf("%s: Invalid minnondirtypagetxpercents! Set to default values\n", funname);  
+        fflush(stdout); 
+        minnondirtypagetxpercents = MPLM_DEFAULT_MINNONDIRTY_TX_PERCENTS;  
     }
 
     mplm_send_counter = 0;
     mplm_send_cycle_size = MPLM_DEFAULT_TX_CYCLE;
+
+    mplm_minimal_tx_ratio = ((double)(minnondirtypagetxpercents)/100.0);
+
+    mplm_dirty_pages_sent = 0;
+    mplm_dirty_pages_allot = (int)((double)(((double)(initdirtypagetxpercents))/100.0)*((double)mplm_send_cycle_size));
+    mplm_nondirty_pages_sent = 0;
+    mplm_nondirty_pages_allot = mplm_send_cycle_size - mplm_dirty_pages_allot;
+
+    mplm_interval = (int) dirtypagetrackinginterval;
+    mplm_interval_usec = 0;
+    max_mplm_interval = (int) dirtypagetrackinginterval;
+
+    printf("%s: mplm_interval = %d mplm_minimal_tx_ratio = %lf \n", funname, mplm_interval, mplm_minimal_tx_ratio);
+    fflush(stdout); 
 
 }
 
