@@ -1451,11 +1451,9 @@
 #
 # Enable or disable mplm migration.
 #
-# @enable: true to enable, false to disable.
+# @mode: string indicating mode of operation default is precopy.
 #
 # @dirtypagetrackinginterval: MPLM interval duration in seconds.
-#
-# @mode: number indicating mode of operation default is 1.
 #
 # @initdirtypagetxpercents: initial percentage number of dirty pages to be transmitted in one batch.
 #
@@ -1466,34 +1464,16 @@
 # Example:
 #
 # -> { "execute": "set-mplm-migration",
-#      "arguments": {"enable": true, "dirtypagetrackinginterval": 3, "mode": 1, "initdirtypagetxpercents": 50, "minnondirtypagetxpercents": 10} }
+#      "arguments": {"mode": "precopy", "dirtypagetrackinginterval": 3, "initdirtypagetxpercents": 50, "minnondirtypagetxpercents": 10} }
 # <- { "return": {} }
 #
 # Since: 4.1
 ##
 { 'command': 'set-mplm-migration',
-  'data': { 'enable': 'bool', 'dirtypagetrackinginterval': 'int', 'mode': 'int', 'initdirtypagetxpercents': 'int', 'minnondirtypagetxpercents': 'int'} }
-
-
-##
-# @set-mplm-extend-live:
-#
-# This command tells mplm to extend live migration until the set-mplm-end-live is called.
-#
-# Returns: nothing.
-#
-# Example:
-#
-# -> { "execute": "set-mplm-extend-live" }
-# <- { "return": {} }
-#
-# Since 2.9
-##
-{ 'command': 'set-mplm-extend-live' }
-
+  'data': { 'mode': 'str', 'dirtypagetrackinginterval': 'int', 'initdirtypagetxpercents': 'int', 'minnondirtypagetxpercents': 'int'} }
 
 ##
-# @set-mplm-end-live:
+# @set-mplm-end-extended-live:
 #
 # This command tells mplm to stop live migration and enter downtime period.
 #
@@ -1501,47 +1481,12 @@
 #
 # Example:
 #
-# -> { "execute": "set-mplm-end-live" }
+# -> { "execute": "set-mplm-end-extended-live" }
 # <- { "return": {} }
 #
 # Since 2.9
 ##
-{ 'command': 'set-mplm-end-live' }
-
-
-##
-# @live-checkpointing-enable:
-#
-# This command enables live checkpointing operation.
-#
-# Returns: nothing.
-#
-# Example:
-#
-# -> { "execute": "live-checkpointing-enable" }
-# <- { "return": {} }
-#
-# Since 2.9
-##
-{ 'command': 'live-checkpointing-enable' }
-
-
-##
-# @live-checkpointing-disable:
-#
-# This command disables live checkpointing.
-#
-# Returns: nothing.
-#
-# Example:
-#
-# -> { "execute": "live-checkpointing-disable" }
-# <- { "return": {} }
-#
-# Since 2.9
-##
-{ 'command': 'live-checkpointing-disable' }
-
+{ 'command': 'set-mplm-end-extended-live' }
 
 ##
 # @enable-max-migration-rate-limit:
@@ -1559,7 +1504,6 @@
 ##
 { 'command': 'enable-max-migration-rate-limit' }
 
-
 ##
 # @disable-max-migration-rate-limit:
 #
@@ -1575,7 +1519,6 @@
 # Since 2.9
 ##
 { 'command': 'disable-max-migration-rate-limit' }
-
 
 ##
 # @mplcr-post-checkpointing-script:
@@ -1597,21 +1540,3 @@
 #
 ##
 { 'command': 'mplcr-post-checkpointing-script', 'data': {'uri': 'str' } }
-
-
-##
-# @mplcr-stop-after-checkpointing:
-#
-# This command makes the source vm stop after checkpointing .
-#
-# Returns: nothing.
-#
-# Example:
-#
-# -> { "execute": "mplcr-stop-after-checkpointing" }
-# <- { "return": {} }
-#
-# Since 2.9
-##
-{ 'command': 'mplcr-stop-after-checkpointing' }
-

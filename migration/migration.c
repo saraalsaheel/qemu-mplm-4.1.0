@@ -102,8 +102,36 @@
 #define 	MPLM_ENABLE	1
 #define 	MPLM_DISABLE	0
 
-#define 	MPLM_LIVE_MIGRATION_MODE		1
-#define 	MPLM_LIVE_CHECKPOINT_MODE		2
+#define         MPLM_NUMBER_OF_MODES                                    11
+
+#define         RESERVE_MODE                                            0
+
+#define 	PRECOPY_LIVE_MIGRATION_MODE				1 // MPLM_DISABLE
+#define 	PRECOPY_LIVE_CHECKPOINT_MODE				2 // MPLM_DISABLE
+#define 	PRECOPY_LIVE_CHECKPOINT_AND_STOP_SRC_VM_MODE		3 // MPLM_DISABLE
+
+#define 	STOPANDCOPY_MIGRATION_MODE				4 // MPLM_DISABLE
+#define 	STOPANDCOPY_CHECKPOINT_MODE				5 // MPLM_DISABLE
+#define 	STOPANDCOPY_CHECKPOINT_AND_STOP_SRC_VM_MODE		6 // MPLM_DISABLE
+
+#define 	MPLM_LIVE_MIGRATION_MODE				7 // MPLM_ENABLE
+#define 	MPLM_LIVE_CHECKPOINT_MODE				8 // MPLM_ENABLE
+#define 	MPLM_LIVE_CHECKPOINT_AND_STOP_SRC_VM_MODE		9 // MPLM_ENABLE
+#define 	MPLM_LIVE_CHECKPOINT_EXTEND_LIVE_MODE			10 // MPLM_ENABLE
+
+const char *mplm_mode_str[MPLM_NUMBER_OF_MODES] = {
+    "reserved\0", 
+    "precopy\0", 
+    "precopycr\0", 
+    "precopycr-stop-src\0",
+    "stopcopy\0", 
+    "stopcopycr\0",
+    "stopcopycr-stop-src\0",
+    "mplm\0", 
+    "mplcr\0", 
+    "mplcr-stop-src\0", 
+    "mplcr-extend-live\0"
+}; 
 
 #define         MPLM_DEFAULT_INV_INTERVAL               3
 #define         MPLM_DEFAULT_TX_CYCLE                   1024
@@ -111,6 +139,7 @@
 #define         MPLM_DEFAULT_MINNONDIRTY_TX_PERCENTS    10
 
 int 		mplm_flag 			= MPLM_DISABLE; 
+int 		mplm_operating_mode 		= PRECOPY_LIVE_MIGRATION_MODE;
 
 int             mplm_interval 			= MPLM_DEFAULT_INV_INTERVAL;  // in sec.
 int             mplm_interval_usec 		= 0; // in usec.
@@ -142,10 +171,15 @@ extern int      mplm_live_migration_stage_finish;
 uint64_t        mplm_bitmap_sync_time = 0;
 int             mplm_debug_i = 0;
 
-int 		mplm_live_checkpointing_flag = 0;
 int 		mplm_max_migration_rate_limit_flag = 0;
-int 		mplm_use_post_checkpoint_script_flag = 0;
-int 		mplm_stop_after_checkpointing_finish_flag = 0;
+
+int             mplm_checkpoint_flag = 0; // set along with operating mode in qmp_set_mplm_migration
+int 		mplm_use_post_checkpoint_script_flag = 0; // set by an explicit qmp command
+int 		mplm_stop_after_checkpointing_finish_flag = 0; // set by an explicit qmp command
+int             mplm_extend_live_migration_flag = 0; // later on, we may need a mutex o access this var
+int             mplcr_snapshot_flag = 0;
+
+extern void     mplcr_snapshot_blkdev_processing(void);
 
 /***** End of MPLM Definitions and global variables *****
 */
@@ -451,16 +485,18 @@ static void process_incoming_migration_bh(void *opaque)
      */
     qemu_announce_self(&mis->announce_timer, migrate_announce_params());
 
-//MPLM-MPLCR
+// MPLM-MPLCR
     const char *funname="process_incoming_migration_bh()\0"; 
-    if(mplm_live_checkpointing_flag){
+
+    if(mplm_checkpoint_flag){
         // stop vm execution
         autostart = false; 
-        printf("%s: MPLCR live checkpoining is ON. autostart = false, Pause the VM\n", funname); 
+        printf("%s: MPLM or PRECOPY live checkpoining is ON. autostart = false, Pause the VM\n", funname); 
+        printf("%s: current mplm_flag = %d and mplm_operating_mode = %d\n", funname, mplm_flag, mplm_operating_mode); 
         fflush(stdout); 
 
-        //change migration flag from checkpointing to migration (default)
-        mplm_live_checkpointing_flag = 0; 
+        // Later on if users want to continue VM under other mplm_flag or operating mode,
+        // they must issue qmp_set_mplm... command with appropriate parameters accordingly. 
     }    
 
     if (multifd_load_cleanup(&local_err) != 0) {
@@ -825,10 +861,6 @@ MigrationParameters *qmp_query_migrate_parameters(Error **errp)
     params->tls_authz = g_strdup(s->parameters.tls_authz);
     params->has_max_bandwidth = true;
     params->max_bandwidth = s->parameters.max_bandwidth;
-
-// MPLM 
-    mplm_max_migration_rate_limit_flag = 0;
-
     params->has_downtime_limit = true;
     params->downtime_limit = s->parameters.downtime_limit;
     params->has_x_checkpoint_delay = true;
@@ -1409,6 +1441,10 @@ static void migrate_params_apply(MigrateSetParameters *params, Error **errp)
 
     if (params->has_max_bandwidth) {
         s->parameters.max_bandwidth = params->max_bandwidth;
+
+// MPLM reset max rate flag
+        mplm_max_migration_rate_limit_flag = 0;
+
         if (s->to_dst_file && !migration_in_postcopy()) {
             qemu_file_set_rate_limit(s->to_dst_file,
                                 s->parameters.max_bandwidth / XFER_LIMIT_RATIO);
@@ -1512,33 +1548,17 @@ void qmp_migrate_start_postcopy(Error **errp)
     atomic_set(&s->start_postcopy, true);
 }
 
-// MPLM 
-int qmp_mplm_extend_live_migration = 0;
-
-extern int mplm_extend_live_migration(void);
-
-void qmp_set_mplm_extend_live(Error **errp)
+void qmp_set_mplm_end_extended_live(Error **errp)
 {
-    qmp_mplm_extend_live_migration = 1;
-    printf("Enable live migration extension capability! set extension var to 1.\n");
-}
-
-void qmp_set_mplm_end_live(Error **errp)
-{
-    qmp_mplm_extend_live_migration = 0;
-    printf("End live migration extension capability! set extension var to 0.\n");
-}
-
-void qmp_live_checkpointing_enable(Error **errp)
-{
-    mplm_live_checkpointing_flag = 1;
-    printf("Enable live checkpointing. After finishes, it will be disable.\n");
-}
-
-void qmp_live_checkpointing_disable(Error **errp)
-{
-    mplm_live_checkpointing_flag = 0;
-    printf("Disable live checkpointing.\n");
+    if(mplm_extend_live_migration_flag){
+        mplm_extend_live_migration_flag = 0;
+        printf("End live migration extension capability! set mplm_extend_live_migration = 0.\n");
+        fflush(stdout); 
+    }
+    else{
+        printf("Error: receive end extended live when current operating mode is %d\n", mplm_operating_mode);
+        fflush(stdout); 
+    }
 }
 
 void qmp_enable_max_migration_rate_limit(Error **errp)
@@ -1799,6 +1819,7 @@ bool migration_is_idle(void)
 
 void migrate_init(MigrationState *s)
 {
+    // MPLM
     const char *funname="migrate_init()\0"; 
     /*
      * Reinitialise all migration state, except
@@ -1917,11 +1938,6 @@ void qmp_mplcr_post_checkpointing_script(const char *uri, Error **errp)
 
     const char *funname="qmp_mplcr_post_checkpointing_script()\0"; 
 
-    if (!((mplm_flag)&&(mplm_live_checkpointing_flag))) {
-        error_setg(errp, "Error! script only allowed with MPLCR enabled");
-        return;
-    }    
-
     // MPLM
     printf("%s: defining post checkpointing script (usually used for creating btrfs snapshots).\n", funname); 
     fflush(stdout); 
@@ -1941,17 +1957,6 @@ void qmp_mplcr_post_checkpointing_script(const char *uri, Error **errp)
         error_propagate(errp, local_err);
         return;
     }    
-}
-
-int mplcr_stop_after_checkpointing_flag = 0;
-
-// MPLM
-void qmp_mplcr_stop_after_checkpointing(Error **errp)
-{
-    const char *funname="qmp_mplcr_stop_after_checkpointing()\0"; 
-
-    mplcr_stop_after_checkpointing_flag = 1;
-    printf("%s: Enable mplcr stop after checkpointing. This flag Will be disable when checkpointing is done!\n", funname);
 }
 
 void qmp_migrate_recover(const char *uri, Error **errp)
@@ -2105,7 +2110,7 @@ void qmp_migrate(const char *uri, bool has_blk, bool blk,
 
     // MPLM
     const char *funname="qmp_migrate()\0"; 
-    printf("%s: Start performing migration!\n", funname);
+    printf("%s: Start a migration!\n", funname);
     fflush(stdout);
 
     if (!migrate_prepare(s, has_blk && blk, has_inc && inc,
@@ -2926,16 +2931,32 @@ static int migration_maybe_pause(MigrationState *s,
     return s->state == new_state ? 0 : -EINVAL;
 }
 
+// MPLM MPLCR
+
+static void mplm_reset_flags(void)
+{
+    mplm_flag = MPLM_DISABLE; 
+    mplm_operating_mode = PRECOPY_LIVE_MIGRATION_MODE; 
+    mplm_checkpoint_flag = 0; 
+    mplm_use_post_checkpoint_script_flag = 0; 
+    mplm_stop_after_checkpointing_finish_flag = 0; 
+    mplm_extend_live_migration_flag = 0; // we may need mutex for this variable
+    mplcr_snapshot_flag = 0;
+}
+
 /**
  * migration_completion: Used by migration_thread when there's not much left.
  *   The caller 'breaks' the loop when this returns.
  *
  * @s: Current migration state
  */
+
 static void migration_completion(MigrationState *s)
 {
     int ret;
     int current_active_state = s->state;
+    // MPLM
+    const char *funname="migration_completion()\0"; 
 
     if (s->state == MIGRATION_STATUS_ACTIVE) {
         qemu_mutex_lock_iothread();
@@ -2945,7 +2966,7 @@ static void migration_completion(MigrationState *s)
         ret = global_state_store();
 
         if (!ret) {
-            bool inactivate = !migrate_colo_enabled();
+            bool inactivate = !(migrate_colo_enabled() || mplm_checkpoint_flag); // MPLM reset bdrv inactive flag
             ret = vm_stop_force_state(RUN_STATE_FINISH_MIGRATE);
             if (ret >= 0) {
                 ret = migration_maybe_pause(s, &current_active_state,
@@ -2953,9 +2974,36 @@ static void migration_completion(MigrationState *s)
             }
             if (ret >= 0) {
                 qemu_file_set_rate_limit(s->to_dst_file, INT64_MAX);
+
                 ret = qemu_savevm_state_complete_precopy(s->to_dst_file, false,
                                                          inactivate);
+                // MPLCR MPLM
+                if(mplm_checkpoint_flag){
+
+                  printf("%s: set bdrv after checkpoint to active\n", funname);
+                  fflush(stdout);
+
+                  if(mplm_use_post_checkpoint_script_flag){
+                    int mplm_ret;
+                    // using btrfs
+                    printf("%s: execute post checkpoint cmd: %s\n", funname, mplm_post_checkpoint_cmd);
+                    mplm_ret = system(mplm_post_checkpoint_cmd);
+                    printf("%s: system mplm return %d\n", funname, mplm_ret);
+                    fflush(stdout);
+                  }else{
+                    if(mplcr_snapshot_flag){
+                      // using qcow2 
+                      mplcr_snapshot_blkdev_processing();
+                    } else {
+                      printf("%s: Error no qmp_transaction parameter defined. run VM with no new root image.\n", funname);
+                      fflush(stdout);
+                    }
+                  }
+                }
+                // MPLM MPLCR
+                mplm_reset_flags(); 
             }
+
             if (inactivate && ret >= 0) {
                 s->block_inactive = true;
             }
@@ -3558,38 +3606,79 @@ void migration_global_dump(Monitor *mon)
 /* 
  07-Sep-19: MPLM migration is an optional migration mechanism that users must use a qmp 
  command to set up migration configutation. The default mechanism is the original one. 
- Users are required to enable mplm only at the sender side (for MPLM version 2). 
-
- After users enable mplm with this command, stting the "enable" parameter to true, 
- the original "migrate" and "savevm" operations would not work. 
- If users want to use the original "migrate" and "savevm", they have to issue 
- the following  qmp command and set the "enable" parameter to false. 
 */
-void qmp_set_mplm_migration(bool enable, int64_t dirtypagetrackinginterval,
-     int64_t mode, int64_t initdirtypagetxpercents, int64_t minnondirtypagetxpercents, Error **errp)
+void qmp_set_mplm_migration(const char *mode, int64_t dirtypagetrackinginterval,
+         int64_t initdirtypagetxpercents, int64_t minnondirtypagetxpercents, Error **errp)
 {
     const char *funname="qmp_set_mplm_migration()\0"; 
+    int i; 
 
-    printf("%s: enable=%d, dirtypagetrackinginterval=%"PRId64", mode=%"PRId64",\n    initdirtypagetxpercents=%"PRId64", minnondirtypagetxpercents=%"PRId64" \n", 
-        funname, (int)enable, dirtypagetrackinginterval, mode, initdirtypagetxpercents, minnondirtypagetxpercents); 
+    printf("%s: mode=%s, dirtypagetrackinginterval=%"PRId64", initdirtypagetxpercents=%"PRId64", minnondirtypagetxpercents=%"PRId64" \n", 
+        funname, mode, dirtypagetrackinginterval, initdirtypagetxpercents, minnondirtypagetxpercents); 
     fflush(stdout); 
     
-    if((int)enable){
-	mplm_flag = MPLM_ENABLE; 
-    }else{
+    for(i=0; i < MPLM_NUMBER_OF_MODES; i++){
+        if(strncmp(mode, mplm_mode_str[i], strlen(mplm_mode_str[i]))){
+            mplm_operating_mode = i; 
+            break;
+        }
+    }
+ 
+    if((i < 1)||(i >= MPLM_NUMBER_OF_MODES)){
+        printf("%s: undefined operating mode %s ! The default precopy mechanism is used.\n", funname, mode);  
+        fflush(stdout); 
 	mplm_flag = MPLM_DISABLE; 
+        mplm_operating_mode = PRECOPY_LIVE_MIGRATION_MODE; 
+        // quit setting up. The mplm_flag should all entrances to every mplm operation. 
         return; 
     }
-
-    if(mode == MPLM_LIVE_MIGRATION_MODE){
-        mplm_live_checkpointing_flag = 0;
-    }
-    else if(mode == MPLM_LIVE_CHECKPOINT_MODE){
-        mplm_live_checkpointing_flag = 1;
-    }
     else{
-        printf("%s: Undefined MPLM migration mode %" PRId64 "\n", funname, mode);  
+        printf("%s: operating mode of %s = %d is found.\n", funname, mode, mplm_operating_mode);  
         fflush(stdout); 
+    }
+
+    mplm_flag = MPLM_DISABLE; 
+    mplm_checkpoint_flag = 0; 
+    mplm_use_post_checkpoint_script_flag = 0; 
+    mplm_stop_after_checkpointing_finish_flag = 0; 
+    mplm_extend_live_migration_flag = 0;
+
+    switch(mplm_operating_mode){
+        case PRECOPY_LIVE_MIGRATION_MODE: 
+            break; 
+        case PRECOPY_LIVE_CHECKPOINT_MODE: 
+            mplm_checkpoint_flag = 1; 
+            break; 
+        case PRECOPY_LIVE_CHECKPOINT_AND_STOP_SRC_VM_MODE: 
+            mplm_checkpoint_flag = 1; 
+            mplm_stop_after_checkpointing_finish_flag = 1; 
+            break; 
+        case STOPANDCOPY_MIGRATION_MODE: 
+            break; 
+        case STOPANDCOPY_CHECKPOINT_MODE: 
+            mplm_checkpoint_flag = 1; 
+            break; 
+        case STOPANDCOPY_CHECKPOINT_AND_STOP_SRC_VM_MODE: 
+            mplm_checkpoint_flag = 1; 
+            mplm_stop_after_checkpointing_finish_flag = 1; 
+            break; 
+        case MPLM_LIVE_MIGRATION_MODE: 
+	    mplm_flag = MPLM_ENABLE; 
+            break; 
+        case MPLM_LIVE_CHECKPOINT_MODE: 
+	    mplm_flag = MPLM_ENABLE; 
+            mplm_checkpoint_flag = 1; 
+            break; 
+        case MPLM_LIVE_CHECKPOINT_AND_STOP_SRC_VM_MODE: 
+	    mplm_flag = MPLM_ENABLE; 
+            mplm_checkpoint_flag = 1; 
+            mplm_stop_after_checkpointing_finish_flag = 1; 
+            break; 
+        case MPLM_LIVE_CHECKPOINT_EXTEND_LIVE_MODE: 
+	    mplm_flag = MPLM_ENABLE; 
+            mplm_checkpoint_flag = 1; 
+            mplm_extend_live_migration_flag = 1;
+            break; 
     }
 
     if ((initdirtypagetxpercents <= 0)||(initdirtypagetxpercents >= 100)){
